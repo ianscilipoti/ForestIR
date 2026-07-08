@@ -1,6 +1,7 @@
 # Forest Impulse Response / Sound Simulation
 
-**Paper (arXiv):** https://arxiv.org/abs/XXXXXXXX
+**Paper (arXiv):** 
+https://arxiv.org/abs/2607.06299
 
 Simulate forest impulse responses (IRs) and render microphone-array recordings of bird sounds under realistic acoustic, environmental, and noise conditions.
 
