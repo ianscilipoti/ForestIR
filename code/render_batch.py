@@ -85,6 +85,51 @@ def load_positions_csv(path, delimiter=","):
     return arr.astype(np.float64)
 
 
+def load_source_extras_csv(path, n_rows, delimiter=","):
+    """
+    Read optional per-source columns used by --mix-sources (case-insensitive headers):
+      wav     : dry source WAV (absolute, or relative to the repo root); blank -> --bird-wav
+      gain    : linear gain before mixing; blank -> 1.0
+      onset_s : start time in the mix, seconds; blank -> 0.0
+    Returns a list of n_rows dicts with keys "wav" (None if unset), "gain", "onset_s".
+    Rows are matched to load_positions_csv() output by order (blank lines skipped).
+    """
+    extras = [{"wav": None, "gain": 1.0, "onset_s": 0.0} for _ in range(n_rows)]
+    with open(path, "r", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter=delimiter)
+        if not reader.fieldnames:
+            return extras
+        lower = {name.strip().lower(): name for name in reader.fieldnames if name}
+        if not any(k in lower for k in ("wav", "gain", "onset_s")):
+            return extras
+        rows = [r for r in reader if any(str(v or "").strip() for v in r.values())]
+
+    if len(rows) != n_rows:
+        raise ValueError(
+            f"Source CSV {path!r}: found {len(rows)} data rows but {n_rows} positions."
+        )
+    for i, row in enumerate(rows):
+        def cell(key):
+            col = lower.get(key)
+            return "" if col is None else str(row.get(col) or "").strip()
+
+        if cell("wav"):
+            extras[i]["wav"] = resolve_cli_path(cell("wav"))
+        if cell("gain"):
+            extras[i]["gain"] = float(cell("gain"))
+        if cell("onset_s"):
+            extras[i]["onset_s"] = float(cell("onset_s"))
+    return extras
+
+
+def rename_per_mic_files(out_per, tag, mic_names):
+    for ch, mic_label in enumerate(mic_names or []):
+        old_path = os.path.join(out_per, f"{tag}_mic{ch:02d}.wav")
+        new_path = os.path.join(out_per, f"{tag}_{mic_label}.wav")
+        if os.path.exists(old_path):
+            os.replace(old_path, new_path)
+
+
 def load_mic_positions_csv(path, delimiter=","):
     """Return (positions [N,3], device_names [N]) in CSV row order."""
     data = np.genfromtxt(path, delimiter=delimiter, names=True, dtype=None, encoding=None)
@@ -247,7 +292,20 @@ def build_parser():
     p.add_argument(
         "--bird-wav",
         default=None,
-        help="Path to clean bird WAV to convolve (mono or stereo ok). Required.",
+        help=(
+            "Path to clean bird WAV to convolve (mono or stereo ok). Required, unless "
+            "--mix-sources is set and every source row has its own 'wav' column."
+        ),
+    )
+    p.add_argument(
+        "--mix-sources",
+        action="store_true",
+        default=False,
+        help=(
+            "Render every row of the source CSV into ONE scene (same forest) and mix them "
+            "into a single multichannel WAV, with noise added once to the mix. Optional "
+            "source CSV columns: wav, gain, onset_s. Default: off (one render per source)."
+        ),
     )
     p.add_argument(
         "--output-dir",
@@ -437,7 +495,7 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
 
-    if not args.bird_wav:
+    if not args.bird_wav and not args.mix_sources:
         raise ValueError("--bird-wav is required.")
 
     fr_x = list(args.forest_range_x)
@@ -470,7 +528,7 @@ def main():
         src_choice = args.src
         src_csv_path = resolve_builtin_src_csv(src_choice)
 
-    bird_wav_path = resolve_cli_path(args.bird_wav)
+    bird_wav_path = resolve_cli_path(args.bird_wav) if args.bird_wav else None
     if args.noise_path:
         noise_path = resolve_cli_path(args.noise_path)
     elif args.noise_source and args.noise_source != "default":
@@ -495,6 +553,19 @@ def main():
         raise ValueError(f"Mic CSV {mic_csv_path} did not parse as [N,3]. Got {mic_poss.shape}")
     if src_poss.ndim != 2 or src_poss.shape[1] != 3:
         raise ValueError(f"Source CSV {src_csv_path} did not parse as [N,3]. Got {src_poss.shape}")
+
+    src_extras = None
+    if args.mix_sources:
+        src_extras = load_source_extras_csv(src_csv_path, src_poss.shape[0])
+        for i, ex in enumerate(src_extras):
+            if ex["wav"] is None:
+                if bird_wav_path is None:
+                    raise ValueError(
+                        f"Source row {i} has no 'wav' value and --bird-wav was not given."
+                    )
+                ex["wav"] = bird_wav_path
+            if not os.path.exists(ex["wav"]):
+                raise FileNotFoundError(f"Source row {i}: WAV not found: {ex['wav']}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"Loaded {mic_poss.shape[0]} microphones from {mic_csv_path}")
@@ -595,94 +666,144 @@ def main():
         "forest_range_y",
         "scene_seed",
         "noise_seed",
+        "mix_sources",
+        "n_sources_in_mix",
+        "src_gain",
+        "src_onset_s",
     ]
+
+    def manifest_row(tag, out_mc, out_per, idx, pos_src, src_wav, noise_seed, gain=1.0, onset_s=0.0, n_mix=1):
+        return {
+            "batch": batch,
+            "src_uid": make_src_uid(src_csv_path, idx, pos_src),
+            "tag": tag,
+            "mc_wav": out_mc,
+            "per_mic_dir": out_per,
+            "src_idx": idx,
+            "src_x": float(pos_src[0]),
+            "src_y": float(pos_src[1]),
+            "src_z": float(pos_src[2]),
+            "mic_cfg": mic_choice,
+            "mic_csv": mic_csv_path,
+            "src_cfg": src_choice,
+            "src_csv": src_csv_path,
+            "noise_model": args.noise_model,
+            "noise_level": args.noise_level,
+            "noise_path": noise_path,
+            "temp_c": args.temp_c,
+            "rh_percent": args.rh_percent,
+            "pressure_hpa": args.pressure_hpa,
+            "tree_csv": tree_csv_path,
+            "n_trees": manifest_n_trees,
+            "tree_height": args.tree_height,
+            "tree_sampling_algo": args.tree_sampling_algo if tree_mode == "random" else "n/a",
+            "min_tree_spacing_m": args.min_tree_spacing if tree_mode == "random" else "",
+            "trunk_diameter_min_m": args.trunk_diameter_min,
+            "trunk_diameter_max_m": args.trunk_diameter_max,
+            "apply_branch_leaf": args.apply_branch_leaf,
+            "n_branch_leaf_scatterers": args.n_branch_leaf_scatterers,
+            "branch_leaf_z_min": args.branch_leaf_z_min,
+            "branch_leaf_z_max": args.branch_leaf_z_max,
+            "ground_type": args.ground_type,
+            "floor_reflection_coef": args.floor_reflection_coef,
+            "fs": args.fs,
+            "bird_wav": src_wav,
+            "tree_mode": tree_mode,
+            "forest_range_x": f"{fr_x[0]},{fr_x[1]}",
+            "forest_range_y": f"{fr_y[0]},{fr_y[1]}",
+            "scene_seed": args.scene_seed,
+            "noise_seed": noise_seed,
+            "mix_sources": bool(args.mix_sources),
+            "n_sources_in_mix": n_mix,
+            "src_gain": gain,
+            "src_onset_s": onset_s,
+        }
+
+    common_kwargs = dict(
+        micPoss=mic_poss.astype(np.float64),
+        fs_ir=args.fs,
+        temp_c=args.temp_c,
+        nTrees=render_n_trees,
+        forest_kwargs=forest_kwargs,
+        model_id=model_id,
+        snr_db=None,
+        noise_level=args.noise_level,
+        noise_kwargs=noise_kwargs if noise_kwargs else None,
+        scene_seed=args.scene_seed,
+    )
 
     with open(manifest_path, "w", newline="") as manifest_f:
         manifest = csv.DictWriter(manifest_f, fieldnames=manifest_fieldnames)
         manifest.writeheader()
 
-        for idx, pos_src in enumerate(src_poss):
-            tag = f"{mic_choice}_{src_choice}_nl{args.noise_level:.2f}_src{idx:03d}"
+        if args.mix_sources:
+            # One scene: every source row rendered into the same forest, mixed, noise added once.
+            # One manifest row per source, all sharing the same tag / mc_wav.
+            n_src = len(src_poss)
+            tag = f"{mic_choice}_{src_choice}_nl{args.noise_level:.2f}_mix{n_src:03d}"
             out_mc = os.path.join(args.output_dir, f"{tag}.wav")
             out_per = os.path.join(args.output_dir, f"per_mic_{tag}")
             os.makedirs(out_per, exist_ok=True)
+            noise_seed = args.noise_seed
 
-            pe = max(1, int(args.print_every))
-            if not args.quiet and (idx % pe == 0 or idx == len(src_poss) - 1):
-                print(f"[{idx+1}/{len(src_poss)}] Rendering source at {pos_src}")
-
-            noise_seed = None if args.noise_seed is None else (args.noise_seed + idx)
+            sources = [
+                {"wav": ex["wav"], "pos": pos, "gain": ex["gain"], "onset_s": ex["onset_s"]}
+                for pos, ex in zip(src_poss, src_extras)
+            ]
+            if not args.quiet:
+                print(f"Mixing {n_src} sources into one scene:")
+                for i, s in enumerate(sources):
+                    print(
+                        f"  [{i}] pos={s['pos']} gain={s['gain']} onset_s={s['onset_s']} "
+                        f"wav={os.path.basename(s['wav'])}"
+                    )
 
             with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
-                _ = FR.synthesize_array_observation(
-                    src_wav_path=bird_wav_path,
-                    posSrc=pos_src.astype(np.float64),
-                    micPoss=mic_poss.astype(np.float64),
-                    fs_ir=args.fs,
-                    temp_c=args.temp_c,
-                    nTrees=render_n_trees,
-                    forest_kwargs=forest_kwargs,
-                    model_id=model_id,
-                    snr_db=None,
-                    noise_level=args.noise_level,
-                    noise_kwargs=noise_kwargs if noise_kwargs else None,
-                    scene_seed=args.scene_seed,
+                _ = FR.synthesize_multi_source_observation(
+                    sources=sources,
                     noise_seed=noise_seed,
                     out_multichannel_path=out_mc,
                     out_per_channel_dir=out_per,
                     out_basename=tag,
+                    **common_kwargs,
                 )
+            rename_per_mic_files(out_per, tag, mic_names)
 
-            if mic_names:
-                for ch, mic_label in enumerate(mic_names):
-                    old_path = os.path.join(out_per, f"{tag}_mic{ch:02d}.wav")
-                    new_path = os.path.join(out_per, f"{tag}_{mic_label}.wav")
-                    if os.path.exists(old_path):
-                        os.replace(old_path, new_path)
+            for idx, s in enumerate(sources):
+                manifest.writerow(
+                    manifest_row(
+                        tag, out_mc, out_per, idx, s["pos"], s["wav"], noise_seed,
+                        gain=s["gain"], onset_s=s["onset_s"], n_mix=n_src,
+                    )
+                )
+        else:
+            for idx, pos_src in enumerate(src_poss):
+                tag = f"{mic_choice}_{src_choice}_nl{args.noise_level:.2f}_src{idx:03d}"
+                out_mc = os.path.join(args.output_dir, f"{tag}.wav")
+                out_per = os.path.join(args.output_dir, f"per_mic_{tag}")
+                os.makedirs(out_per, exist_ok=True)
 
-            manifest.writerow(
-                {
-                    "batch": batch,
-                    "src_uid": make_src_uid(src_csv_path, idx, pos_src),
-                    "tag": tag,
-                    "mc_wav": out_mc,
-                    "per_mic_dir": out_per,
-                    "src_idx": idx,
-                    "src_x": float(pos_src[0]),
-                    "src_y": float(pos_src[1]),
-                    "src_z": float(pos_src[2]),
-                    "mic_cfg": mic_choice,
-                    "mic_csv": mic_csv_path,
-                    "src_cfg": src_choice,
-                    "src_csv": src_csv_path,
-                    "noise_model": args.noise_model,
-                    "noise_level": args.noise_level,
-                    "noise_path": noise_path,
-                    "temp_c": args.temp_c,
-                    "rh_percent": args.rh_percent,
-                    "pressure_hpa": args.pressure_hpa,
-                    "tree_csv": tree_csv_path,
-                    "n_trees": manifest_n_trees,
-                    "tree_height": args.tree_height,
-                    "tree_sampling_algo": args.tree_sampling_algo if tree_mode == "random" else "n/a",
-                    "min_tree_spacing_m": args.min_tree_spacing if tree_mode == "random" else "",
-                    "trunk_diameter_min_m": args.trunk_diameter_min,
-                    "trunk_diameter_max_m": args.trunk_diameter_max,
-                    "apply_branch_leaf": args.apply_branch_leaf,
-                    "n_branch_leaf_scatterers": args.n_branch_leaf_scatterers,
-                    "branch_leaf_z_min": args.branch_leaf_z_min,
-                    "branch_leaf_z_max": args.branch_leaf_z_max,
-                    "ground_type": args.ground_type,
-                    "floor_reflection_coef": args.floor_reflection_coef,
-                    "fs": args.fs,
-                    "bird_wav": bird_wav_path,
-                    "tree_mode": tree_mode,
-                    "forest_range_x": f"{fr_x[0]},{fr_x[1]}",
-                    "forest_range_y": f"{fr_y[0]},{fr_y[1]}",
-                    "scene_seed": args.scene_seed,
-                    "noise_seed": noise_seed,
-                }
-            )
+                pe = max(1, int(args.print_every))
+                if not args.quiet and (idx % pe == 0 or idx == len(src_poss) - 1):
+                    print(f"[{idx+1}/{len(src_poss)}] Rendering source at {pos_src}")
+
+                noise_seed = None if args.noise_seed is None else (args.noise_seed + idx)
+
+                with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
+                    _ = FR.synthesize_array_observation(
+                        src_wav_path=bird_wav_path,
+                        posSrc=pos_src.astype(np.float64),
+                        noise_seed=noise_seed,
+                        out_multichannel_path=out_mc,
+                        out_per_channel_dir=out_per,
+                        out_basename=tag,
+                        **common_kwargs,
+                    )
+                rename_per_mic_files(out_per, tag, mic_names)
+
+                manifest.writerow(
+                    manifest_row(tag, out_mc, out_per, idx, pos_src, bird_wav_path, noise_seed)
+                )
 
     print(f"Wrote manifest: {manifest_path}")
     print("Done.")

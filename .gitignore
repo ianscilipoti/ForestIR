@@ -7,3 +7,7 @@ __pycache__/
 *.py[cod]
 output/
 output_*/
+uv.lock
+.python-version
+pyproject.toml
+dataset/source_locations/src_mix_example.csv

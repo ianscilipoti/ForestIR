@@ -712,5 +712,86 @@ def synthesize_array_observation(
         "forest_kwargs": forest_kwargs or {},
     }
 
+
+def synthesize_multi_source_observation(
+    sources, micPoss,
+    fs_ir: int = 384000, temp_c: float = None,
+    nTrees: int = 0, forest_kwargs: dict = None,
+    model_id: int = 1,
+    snr_db: float = None,
+    noise_level: float = 0.0,
+    noise_kwargs: dict = None,
+    scene_seed: int = 1234,
+    noise_seed: int = 1234,
+    out_multichannel_path: str = None,
+    out_per_channel_dir: str = None,
+    out_basename: str = "array",
+):
+    """
+    Render several sources into one shared forest scene and mix them.
+
+    sources: list of dicts, each with
+        "wav"     : path to the dry source WAV
+        "pos"     : (x, y, z) source position in metres
+        "gain"    : optional linear gain applied before mixing (default 1.0)
+        "onset_s" : optional start time of this source in the mix, seconds (default 0.0)
+
+    All sources share scene_seed / forest_kwargs, so they see the same trees.
+    Noise is added once to the summed signal, with noise_level relative to the mix RMS.
+    """
+    if not sources:
+        raise ValueError("synthesize_multi_source_observation needs at least one source.")
+
+    mix = None
+    irs = []
+    for s in sources:
+        pos = np.asarray(s["pos"], dtype=np.float64)
+        sig, _, ir_TxC = render_array_from_source(
+            s["wav"], pos, micPoss,
+            fs_ir=fs_ir, temp_c=temp_c, nTrees=nTrees, forest_kwargs=forest_kwargs,
+            scene_seed=scene_seed,
+        )
+        irs.append(ir_TxC)
+        sig = sig * float(s.get("gain", 1.0))
+        onset_s = float(s.get("onset_s", 0.0))
+        if onset_s < 0:
+            raise ValueError(f"onset_s must be >= 0, got {onset_s}")
+        off = int(round(onset_s * fs_ir))
+        need = off + sig.shape[0]
+        if mix is None:
+            mix = np.zeros((need, sig.shape[1]), dtype=np.float32)
+        elif need > mix.shape[0]:
+            mix = np.pad(mix, ((0, need - mix.shape[0]), (0, 0)))
+        mix[off:need] += sig
+
+    noisy = apply_noise_and_export(
+        mix, fs_ir,
+        model_id=model_id,
+        snr_db=snr_db,
+        noise_level=noise_level,
+        noise_kwargs=noise_kwargs,
+        noise_seed=noise_seed,
+        out_multichannel_path=out_multichannel_path,
+        out_per_channel_dir=out_per_channel_dir,
+        out_basename=out_basename,
+    )
+    return {
+        "signals_TxC": noisy,
+        "fs": fs_ir,
+        "ir_TxC_per_source": irs,
+        "sources": sources,
+        "micPoss": micPoss,
+        "soundVel_mps": C.soundVel,
+        "noise": {
+            "model_id": model_id,
+            "snr_db": snr_db,
+            "noise_level": noise_level,
+            "noise_seed": noise_seed,
+            "noise_kwargs": noise_kwargs or {},
+        },
+        "scene_seed": scene_seed,
+        "forest_kwargs": forest_kwargs or {},
+    }
+
 if __name__ == "__main__":
     generateSampleForestIR()
